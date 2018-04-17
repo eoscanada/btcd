@@ -59,7 +59,19 @@ func (p *PrivateKey) ToECDSA() *ecdsa.PrivateKey {
 // is deterministic (same message and same key yield the same signature) and canonical
 // in accordance with RFC6979 and BIP0062.
 func (p *PrivateKey) Sign(hash []byte) (*Signature, error) {
-	return signRFC6979(p, hash)
+	return signRFC6979(p, hash, nil)
+}
+
+// SignWithCounterFunc generates an ECDSA signature for the provided
+// hash (which should be the result of hashing a larger message) using
+// the private key. Produced signature is deterministic (same message
+// and same key yield the same signature) and canonical in accordance
+// with RFC6979 and BIP0062.
+//
+// This one allows you to pick one of the 4 points, by trying a few
+// values, and ensuring we get an `isCanonical` point.
+func (p *PrivateKey) SignWithCounterFunc(hash []byte, counterFunc func() int) (*Signature, error) {
+	return signRFC6979(p, hash, counterFunc)
 }
 
 // PrivKeyBytesLen defines the length in bytes of a serialized private key.
@@ -70,4 +82,21 @@ const PrivKeyBytesLen = 32
 func (p *PrivateKey) Serialize() []byte {
 	b := make([]byte, 0, PrivKeyBytesLen)
 	return paddedAppend(PrivKeyBytesLen, b, p.ToECDSA().D.Bytes())
+}
+
+func isCanonical(compactSig []byte) bool {
+	// From EOS's codebase, our way of doing Canonical sigs.
+	// https://steemit.com/steem/@dantheman/steem-and-bitshares-cryptographic-security-update
+	//
+	// !(c.data[1] & 0x80)
+	// && !(c.data[1] == 0 && !(c.data[2] & 0x80))
+	// && !(c.data[33] & 0x80)
+	// && !(c.data[33] == 0 && !(c.data[34] & 0x80));
+
+	d := compactSig
+	t1 := (d[1] & 0x80) == 0
+	t2 := !(d[1] == 0 && ((d[2] & 0x80) == 0))
+	t3 := (d[33] & 0x80) == 0
+	t4 := !(d[33] == 0 && ((d[34] & 0x80) == 0))
+	return t1 && t2 && t3 && t4
 }

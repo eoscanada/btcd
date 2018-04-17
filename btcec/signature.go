@@ -342,12 +342,16 @@ func recoverKeyFromSignature(curve *KoblitzCurve, sig *Signature, msg []byte,
 // returned in the format:
 // <(byte of 27+public key solution)+4 if compressed >< padded bytes for signature R><padded bytes for signature S>
 // where the R and S parameters are padde up to the bitlengh of the curve.
-func SignCompact(curve *KoblitzCurve, key *PrivateKey,
-	hash []byte, isCompressedKey bool) ([]byte, error) {
-	sig, err := key.Sign(hash)
+func SignCompact(curve *KoblitzCurve, key *PrivateKey, hash []byte, isCompressedKey bool, counterFunc func() int) ([]byte, error) {
+	sig, err := key.SignWithCounterFunc(hash, counterFunc)
 	if err != nil {
 		return nil, err
 	}
+
+	// See: https://github.com/cryptonomex/secp256k1-zkp/blob/secp256k1-zkp/src/secp256k1.c#L187
+	// See: https://github.com/EOSIO/eos/blob/master/libraries/fc/src/crypto/elliptic_impl_priv.cpp#L96
+	// See: https://github.com/EOSIO/eosjs-ecc/blob/master/src/signature.js#L178
+	// See: https://github.com/btcsuite/btcd/blob/master/btcec/signature.go#L355
 
 	// bitcoind checks the bit length of R and S here. The ecdsa signature
 	// algorithm returns R and S mod N therefore they will be the bitsize of
@@ -385,6 +389,21 @@ func SignCompact(curve *KoblitzCurve, key *PrivateKey,
 	return nil, errors.New("no valid solution for pubkey found")
 }
 
+func SignCompactCanonical(curve *KoblitzCurve, key *PrivateKey, hash []byte, isCompressedKey bool) ([]byte, error) {
+	for i := 0; i < 16; i++ {
+		counterFunc := func() int {
+			counter := i
+			return counter
+		}
+		sig, err := SignCompact(curve, key, hash, isCompressedKey, counterFunc)
+		if !isCanonical(sig) {
+			continue
+		}
+		return sig, err
+	}
+	return nil, fmt.Errorf("couldn't find canonical signature")
+}
+
 // RecoverCompact verifies the compact signature "signature" of "hash" for the
 // Koblitz curve in "curve". If the signature matches then the recovered public
 // key will be returned as well as a boolen if the original key was compressed
@@ -413,12 +432,12 @@ func RecoverCompact(curve *KoblitzCurve, signature,
 }
 
 // signRFC6979 generates a deterministic ECDSA signature according to RFC 6979 and BIP 62.
-func signRFC6979(privateKey *PrivateKey, hash []byte) (*Signature, error) {
-
+func signRFC6979(privateKey *PrivateKey, hash []byte, counterFunc func() int) (*Signature, error) {
 	privkey := privateKey.ToECDSA()
 	N := S256().N
 	halfOrder := S256().halfOrder
-	k := nonceRFC6979(privkey.D, hash)
+	k := nonceRFC6979(privkey.D, hash, counterFunc)
+	fmt.Println("The NONCE my friend", k)
 	inv := new(big.Int).ModInverse(k, N)
 	r, _ := privkey.Curve.ScalarBaseMult(k.Bytes())
 	if r.Cmp(N) == 1 {
@@ -446,8 +465,24 @@ func signRFC6979(privateKey *PrivateKey, hash []byte) (*Signature, error) {
 
 // nonceRFC6979 generates an ECDSA nonce (`k`) deterministically according to RFC 6979.
 // It takes a 32-byte hash as an input and returns 32-byte nonce to be used in ECDSA algorithm.
-func nonceRFC6979(privkey *big.Int, hash []byte) *big.Int {
+func nonceRFC6979(privkey *big.Int, hash []byte, counterFunc func() int) *big.Int {
+	// https://github.com/EOSIO/eosjs-ecc/blob/master/src/ecdsa.js#L72
+	// https://github.com/EOSIO/eosjs-ecc/blob/master/src/ecdsa.js#L9
 
+	/*
+		// From the `cryptonomex/secp256k1-???`'s src/secp256k1.c file:
+
+		static int nonce_function_rfc6979(unsigned char *nonce32, const unsigned char *msg32, const unsigned char *key32, unsigned int counter, const void *data) {
+		   secp256k1_rfc6979_hmac_sha256_t rng;
+		   unsigned int i;
+		   secp256k1_rfc6979_hmac_sha256_initialize(&rng, key32, 32, msg32, 32, (const unsigned char*)data, data != NULL ? 32 : 0);
+		   for (i = 0; i <= counter; i++) {
+		       secp256k1_rfc6979_hmac_sha256_generate(&rng, nonce32, 32);
+		   }
+		   secp256k1_rfc6979_hmac_sha256_finalize(&rng);
+		   return 1;
+		}
+	*/
 	curve := S256()
 	q := curve.Params().N
 	x := privkey
@@ -476,19 +511,32 @@ func nonceRFC6979(privkey *big.Int, hash []byte) *big.Int {
 	// Step G
 	v = mac(alg, k, v)
 
+	counter := 1
+	if counterFunc != nil {
+		counter = counterFunc() + 1
+	}
+
 	// Step H
 	for {
 		// Step H1
 		var t []byte
 
-		// Step H2
-		for len(t)*8 < qlen {
-			v = mac(alg, k, v)
-			t = append(t, v...)
+		// Step H2 , corresponds to secp256k1_rfc6979_hmac_sha256_generate
+		for i := 0; i < counter; i++ {
+			if i > 0 { // invalid clause, reset by secp256k1_rfc6979_hmac_sha256_finalize.. CHECK back.
+				k = mac(alg, k, append(v, 0x00))
+				v = mac(alg, k, v)
+			}
+			fmt.Println("Ohhh okay, starting with i=", i)
+			for len(t)*8 < qlen {
+				v = mac(alg, k, v)
+				t = append(t, v...)
+			}
 		}
 
 		// Step H3
 		secret := hashToInt(t, curve)
+		fmt.Println("Secret mama", secret)
 		if secret.Cmp(one) >= 0 && secret.Cmp(q) < 0 {
 			return secret
 		}
