@@ -499,7 +499,6 @@ func nonceRFC6979(privkey *big.Int, hash []byte, nonce int) *big.Int {
 
 		// Step H3
 		secret := hashToInt(t, curve)
-
 		if secret.Cmp(one) >= 0 && secret.Cmp(q) < 0 {
 			return secret
 		}
