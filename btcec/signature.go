@@ -342,8 +342,8 @@ func recoverKeyFromSignature(curve *KoblitzCurve, sig *Signature, msg []byte,
 // returned in the format:
 // <(byte of 27+public key solution)+4 if compressed >< padded bytes for signature R><padded bytes for signature S>
 // where the R and S parameters are padde up to the bitlengh of the curve.
-func SignCompact(curve *KoblitzCurve, key *PrivateKey, hash []byte, isCompressedKey bool, counterFunc func() int) ([]byte, error) {
-	sig, err := key.SignWithCounterFunc(hash, counterFunc)
+func SignCompact(curve *KoblitzCurve, key *PrivateKey, hash []byte, isCompressedKey bool) ([]byte, error) {
+	sig, err := key.Sign(hash)
 	if err != nil {
 		return nil, err
 	}
@@ -356,6 +356,10 @@ func SignCompact(curve *KoblitzCurve, key *PrivateKey, hash []byte, isCompressed
 	// bitcoind checks the bit length of R and S here. The ecdsa signature
 	// algorithm returns R and S mod N therefore they will be the bitsize of
 	// the curve, and thus correctly sized.
+	return makeCompact(curve, sig, key, hash, isCompressedKey)
+}
+
+func makeCompact(curve *KoblitzCurve, sig *Signature, key *PrivateKey, hash []byte, isCompressedKey bool) ([]byte, error) {
 	for i := 0; i < (curve.H+1)*2; i++ {
 		pk, err := recoverKeyFromSignature(curve, sig, hash, i, true)
 		if err == nil && pk.X.Cmp(key.X) == 0 && pk.Y.Cmp(key.Y) == 0 {
@@ -389,21 +393,6 @@ func SignCompact(curve *KoblitzCurve, key *PrivateKey, hash []byte, isCompressed
 	return nil, errors.New("no valid solution for pubkey found")
 }
 
-func SignCompactCanonical(curve *KoblitzCurve, key *PrivateKey, hash []byte, isCompressedKey bool) ([]byte, error) {
-	for i := 0; i < 16; i++ {
-		counterFunc := func() int {
-			counter := i
-			return counter
-		}
-		sig, err := SignCompact(curve, key, hash, isCompressedKey, counterFunc)
-		if !isCanonical(sig) {
-			continue
-		}
-		return sig, err
-	}
-	return nil, fmt.Errorf("couldn't find canonical signature")
-}
-
 // RecoverCompact verifies the compact signature "signature" of "hash" for the
 // Koblitz curve in "curve". If the signature matches then the recovered public
 // key will be returned as well as a boolen if the original key was compressed
@@ -432,40 +421,70 @@ func RecoverCompact(curve *KoblitzCurve, signature,
 }
 
 // signRFC6979 generates a deterministic ECDSA signature according to RFC 6979 and BIP 62.
-func signRFC6979(privateKey *PrivateKey, hash []byte, counterFunc func() int) (*Signature, error) {
+func signRFC6979(privateKey *PrivateKey, hash []byte, nonce int) (*Signature, error) {
 	privkey := privateKey.ToECDSA()
-	N := S256().N
-	halfOrder := S256().halfOrder
-	k := nonceRFC6979(privkey.D, hash, counterFunc)
-	fmt.Println("The NONCE my friend", k)
-	inv := new(big.Int).ModInverse(k, N)
-	r, _ := privkey.Curve.ScalarBaseMult(k.Bytes())
-	if r.Cmp(N) == 1 {
-		r.Sub(r, N)
-	}
-
-	if r.Sign() == 0 {
-		return nil, errors.New("calculated R is zero")
-	}
+	curveParams := S256()
+	N := curveParams.N
+	halfOrder := curveParams.halfOrder
 
 	e := hashToInt(hash, privkey.Curve)
-	s := new(big.Int).Mul(privkey.D, r)
-	s.Add(s, e)
-	s.Mul(s, inv)
-	s.Mod(s, N)
 
-	if s.Cmp(halfOrder) == 1 {
-		s.Sub(N, s)
-	}
-	if s.Sign() == 0 {
-		return nil, errors.New("calculated S is zero")
+	var r, s *big.Int
+	var err error
+	nonceRFC6979(privkey.D, hash, nonce, func(k *big.Int) bool {
+		// // find canonically valid signature
+
+		// if (curve.isInfinity(Q)) return false
+
+		// r = Q.affineX.mod(n)
+		// var Q = G.multiply(k)
+		var Q *big.Int
+		r, Q = privkey.Curve.ScalarBaseMult(k.Bytes())
+		fmt.Println("MAMA", r, Q)
+
+		// This thing is done OUTSIDE this loop in the JS version, does it change something?
+		if r.Cmp(N) == 1 {
+			r.Sub(r, N)
+		}
+
+		// if Q.Sign() == 0 {
+		// 	err = errors.New("Q's sign is zero")
+		// 	return false
+		// }
+
+		// if (r.signum() === 0) return false
+		if r.Sign() == 0 {
+			err = errors.New("calculated R is zero")
+			return false
+		}
+
+		// s = k.modInverse(n).multiply(e.add(d.multiply(r))).mod(n)
+		// if (s.signum() === 0) return false
+		inv := new(big.Int).ModInverse(k, N)
+		s = new(big.Int).Mul(privkey.D, r)
+		s.Add(s, e)
+		s.Mul(s, inv)
+		s.Mod(s, N)
+
+		if s.Cmp(halfOrder) == 1 {
+			s.Sub(N, s)
+		}
+		if s.Sign() == 0 {
+			err = errors.New("calculated S is zero")
+			return false
+		}
+
+		return true
+	})
+	if err != nil {
+		return nil, err
 	}
 	return &Signature{R: r, S: s}, nil
 }
 
 // nonceRFC6979 generates an ECDSA nonce (`k`) deterministically according to RFC 6979.
 // It takes a 32-byte hash as an input and returns 32-byte nonce to be used in ECDSA algorithm.
-func nonceRFC6979(privkey *big.Int, hash []byte, counterFunc func() int) *big.Int {
+func nonceRFC6979(privkey *big.Int, hash []byte, nonce int, checkSig func(k *big.Int) bool) {
 	// https://github.com/EOSIO/eosjs-ecc/blob/master/src/ecdsa.js#L72
 	// https://github.com/EOSIO/eosjs-ecc/blob/master/src/ecdsa.js#L9
 
@@ -483,6 +502,13 @@ func nonceRFC6979(privkey *big.Int, hash []byte, counterFunc func() int) *big.In
 		   return 1;
 		}
 	*/
+	if nonce > 0 {
+		moreHash := sha256.New()
+		moreHash.Write(hash)
+		moreHash.Write(bytes.Repeat([]byte{0x00}, nonce))
+		hash = moreHash.Sum(nil)
+	}
+
 	curve := S256()
 	q := curve.Params().N
 	x := privkey
@@ -511,35 +537,27 @@ func nonceRFC6979(privkey *big.Int, hash []byte, counterFunc func() int) *big.In
 	// Step G
 	v = mac(alg, k, v)
 
-	counter := 1
-	if counterFunc != nil {
-		counter = counterFunc() + 1
-	}
-
 	// Step H
 	for {
 		// Step H1
 		var t []byte
 
-		// Step H2 , corresponds to secp256k1_rfc6979_hmac_sha256_generate
-		for i := 0; i < counter; i++ {
-			if i > 0 { // invalid clause, reset by secp256k1_rfc6979_hmac_sha256_finalize.. CHECK back.
-				k = mac(alg, k, append(v, 0x00))
-				v = mac(alg, k, v)
-			}
-			fmt.Println("Ohhh okay, starting with i=", i)
-			for len(t)*8 < qlen {
-				v = mac(alg, k, v)
-				t = append(t, v...)
-			}
+		// Step H2
+		for len(t)*8 < qlen {
+			v = mac(alg, k, v)
+			t = append(t, v...)
 		}
 
 		// Step H3
 		secret := hashToInt(t, curve)
-		fmt.Println("Secret mama", secret)
-		if secret.Cmp(one) >= 0 && secret.Cmp(q) < 0 {
-			return secret
+
+		fmt.Println("CHECKING", checkSig(secret))
+		//if secret.Cmp(one) >= 0 && secret.Cmp(q) < 0 && checkSig(secret) {
+		if secret.Sign() > 0 && secret.Cmp(q) < 0 && checkSig(secret) {
+			fmt.Println("Going through")
+			return
 		}
+		fmt.Println("NOT going through")
 		k = mac(alg, k, append(v, 0x00))
 		v = mac(alg, k, v)
 	}

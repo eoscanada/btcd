@@ -8,6 +8,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"errors"
 	"math/big"
 )
 
@@ -59,19 +60,28 @@ func (p *PrivateKey) ToECDSA() *ecdsa.PrivateKey {
 // is deterministic (same message and same key yield the same signature) and canonical
 // in accordance with RFC6979 and BIP0062.
 func (p *PrivateKey) Sign(hash []byte) (*Signature, error) {
-	return signRFC6979(p, hash, nil)
+	return signRFC6979(p, hash, 0)
 }
 
-// SignWithCounterFunc generates an ECDSA signature for the provided
-// hash (which should be the result of hashing a larger message) using
-// the private key. Produced signature is deterministic (same message
-// and same key yield the same signature) and canonical in accordance
-// with RFC6979 and BIP0062.
-//
-// This one allows you to pick one of the 4 points, by trying a few
-// values, and ensuring we get an `isCanonical` point.
-func (p *PrivateKey) SignWithCounterFunc(hash []byte, counterFunc func() int) (*Signature, error) {
-	return signRFC6979(p, hash, counterFunc)
+// SignCanonical goes through signatures and returns only a canonical
+// representations.  This matches the EOS blockchain expectations.
+func (p *PrivateKey) SignCanonical(curve *KoblitzCurve, hash []byte) ([]byte, error) {
+	for i := 0; i < 25; i++ {
+		sig, err := signRFC6979(p, hash, i)
+		if err != nil {
+			return nil, err
+		}
+
+		compactSig, err := makeCompact(curve, sig, p, hash, true)
+		if err != nil {
+			continue
+		}
+
+		if isCanonical(compactSig) {
+			return compactSig, nil
+		}
+	}
+	return nil, errors.New("couldn't find a canonical signature")
 }
 
 // PrivKeyBytesLen defines the length in bytes of a serialized private key.
